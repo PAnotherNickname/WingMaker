@@ -4,90 +4,94 @@ import os
 import sys
 import time
 import math
+import re
 import warnings
 from scipy.optimize import differential_evolution
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
 try:
     from mlx_lm import load, generate
     from mlx_lm.sample_utils import make_sampler
-    from langchain_huggingface import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
 except ImportError:
-    print("❌ Missing Libraries. Run: pip install mlx-lm requests langchain-huggingface chromadb scipy")
+    print("❌ Missing Libraries. Run: pip install mlx-lm requests scipy")
     sys.exit(1)
 
-DELL_LINUX_URL = "http://172.22.228.131:8000/simulate"
-CHROMA_DB_DIR = os.path.expanduser("~/mlx_env/chroma_db")
+DELL_LINUX_URL = "http://172.22.228.131:8000/simulate" 
 
-print("\n⚙️ Launching Aero-Optimizer v12.0 (UNIVERSAL MDO + STRUCTURAL INTEGRITY)...")
-model, tokenizer = load("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+print("\n⚙️ Aero-Optimizer v15.7: Deep Debug Edition")
+model, tokenizer = load("mlx-community/Qwen2.5-14B-Instruct-4bit")
 
-# ====================================================================
-# PRE-FLIGHT
-# ====================================================================
-user_prompt = input("\n🎯 ENTER DESIGN GOAL (e.g., 'Design an ultra-efficient aircraft'): ")
+user_prompt = input("\n🎯 ENTER DESIGN GOAL: ")
 if not user_prompt.strip():
-    user_prompt = "Design a highly efficient aircraft optimized for high lift-to-drag ratio."
+    user_prompt = "Design a highly efficient aircraft with a tail."
 
-print("📚 Querying RAG Database for targeted context...")
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = Chroma(persist_directory=CHROMA_DB_DIR, embedding_function=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.invoke(user_prompt)
-    raw_context = "\n\n".join([d.page_content for d in docs])[:4000]
-except Exception as e:
-    raw_context = ""
+print("🧠 14B Routing Agent Analyzing Request...")
+extract_sys = """You are an aerospace routing agent. Map the user's request to EXACTLY ONE of the following keywords:
+- CONVENTIONAL : Route here if the user asks for a tail, rear stabilizer, or a tail in the back.
+- CANARD       : Route here if the user asks for a front tail, front wing, or canard.
+- FLYING_WING  : Route here if the user asks for a tailless design, a pure wing, or a flying wing.
+- TANDEM       : Route here if the user asks for two main wings, a biplane, or tandem.
+- UNIVERSAL    : Route here if the user DOES NOT specify a physical layout.
+CRITICAL INSTRUCTION: If the user explicitly asks for a "tail", you MUST output CONVENTIONAL.
+Output ONLY the keyword."""
 
-# THE UNIVERSAL SEARCH SPACE (16 VARIABLES)
+extract_prompt = tokenizer.apply_chat_template([{"role": "system", "content": extract_sys}, {"role": "user", "content": user_prompt}], tokenize=False, add_generation_prompt=True)
+llm_route = generate(model, tokenizer, prompt=extract_prompt, max_tokens=20, sampler=make_sampler(temp=0.1)).strip().upper()
+
+target_config = "UNIVERSAL"
+for route in ["CONVENTIONAL", "CANARD", "FLYING_WING", "TANDEM", "UNIVERSAL"]:
+    if route in llm_route: target_config = route
+
+print(f"✅ ACTION ROUTE: {target_config}")
+
 dynamic_bounds = [
-    # --- SURFACE A (The Main Wing) ---
-    (0.1, 2.5),    # 0: Span A 
-    (0.05, 0.4),   # 1: Chord A 
-    (-20.0, 45.0), # 2: Sweep A 
-    (-10.0, 5.0),  # 3: Twist A
-    (0.1, 1.0),    # 4: Taper A 
-    (-0.5, 0.5),   # 5: X Position A 
-    (-0.2, 0.2),   # 6: Z Position A 
-    (0.0, 3.99),   # 7: Airfoil A Index
-    
-    # --- SURFACE B (The Secondary Wing / Tail / Canard) ---
-    (0.1, 2.5),    # 8: Span B
-    (0.05, 0.4),   # 9: Chord B
-    (-20.0, 45.0), # 10: Sweep B
-    (-15.0, 10.0), # 11: Twist B 
-    (0.1, 1.0),    # 12: Taper B
-    (-1.5, 1.5),   # 13: X Position B 
-    (-0.2, 0.2),   # 14: Z Position B 
-    (0.0, 3.99)    # 15: Airfoil B Index
+    (0.1, 2.5), (0.1, 0.4), (-20.0, 45.0), (-10.0, 5.0), (0.1, 1.0), (-0.5, 0.5), (-0.2, 0.2), (0.0, 3.99), # Wing A
+    (0.1, 2.5), (0.05, 0.4), (-20.0, 45.0), (-15.0, 10.0), (0.1, 1.0), (-1.5, 1.5), (-0.2, 0.2), (0.0, 3.99), # Wing B
+    (0.05, 0.2), (0.5, 2.0), (-2.0, 2.0), (0.0, 0.0), (0.2, 1.0), (-1.0, 1.0), (-0.1, 0.1), (0.0, 3.99) # Fuselage
 ]
 
-iteration_count = 0
-best_ld_seen = 0.0
 AIRFOIL_ROSTER = ["mh45", "mh60", "pw75", "naca0012"]
+best_ld_seen = 0.0
 vlm_history = []
 
-# ====================================================================
-# PHASE 1: VLM FITNESS FUNCTION (UNIVERSAL PHYSICS)
-# ====================================================================
+def get_current_config(x_a, x_b, s_b):
+    if s_b < 0.25: return "FLYING_WING"
+    if x_b > x_a + 0.25: return "CONVENTIONAL"
+    if x_b < x_a - 0.25: return "CANARD"
+    return "TANDEM"
+
 def evaluate_design(x):
-    global iteration_count, best_ld_seen
-    
-    # Unpack all 16 variables
+    global best_ld_seen
     s_a, c_a, sw_a, tw_a, ta_a, x_a, z_a, af_idx_a = x[0:8]
     s_b, c_b, sw_b, tw_b, ta_b, x_b, z_b, af_idx_b = x[8:16]
+    s_c, c_c, sw_c, tw_c, ta_c, x_c, z_c, af_idx_c = x[16:24]
     
-    af_a = AIRFOIL_ROSTER[int(af_idx_a)]
-    af_b = AIRFOIL_ROSTER[int(af_idx_b)]
-    
+    current_layout = get_current_config(x_a, x_b, s_b)
+    layout_penalty = 500000.0 if target_config != "UNIVERSAL" and current_layout != target_config else 0.0
+    connection_penalty = 0.0
+
+    if target_config == "CONVENTIONAL":
+        if x_a < x_c: connection_penalty += ((x_c - x_a)**2) * 1e6
+        if x_a > x_c + (c_c * 0.5): connection_penalty += ((x_a - (x_c + c_c * 0.5))**2) * 1e6
+        target_tail_x = x_c + (c_c * 0.7)
+        if x_b < target_tail_x: connection_penalty += ((target_tail_x - x_b)**2) * 1e6
+        if (x_b + c_b) > (x_c + c_c): connection_penalty += (((x_b + c_b) - (x_c + c_c))**2) * 1e6
+    else:
+        if x_a < x_c: connection_penalty += ((x_c - x_a)**2) * 1e6
+        if (x_a + c_a) > (x_c + c_c): connection_penalty += (((x_a + c_a) - (x_c + c_c))**2) * 1e6
+        if x_b < x_c: connection_penalty += ((x_c - x_b)**2) * 1e6
+        if (x_b + c_b) > (x_c + c_c): connection_penalty += (((x_b + c_b) - (x_c + c_c))**2) * 1e6
+
+    if connection_penalty > 1.0 or layout_penalty > 0:
+        return 99999.0 + connection_penalty + layout_penalty
+
     payload = {
         "run_cfd": False,
         "surfaces": [
-            {"span": float(s_a), "chord": float(c_a), "sweep_angle": float(sw_a), "twist": float(tw_a), "taper": float(ta_a), "x": float(x_a), "z": float(z_a), "airfoil_name": af_a},
-            {"span": float(s_b), "chord": float(c_b), "sweep_angle": float(sw_b), "twist": float(tw_b), "taper": float(ta_b), "x": float(x_b), "z": float(z_b), "airfoil_name": af_b}
+            {"span": float(s_a), "chord": float(c_a), "sweep_angle": float(sw_a), "twist": float(tw_a), "taper": float(ta_a), "x": float(x_a), "z": float(z_c), "airfoil_name": AIRFOIL_ROSTER[int(af_idx_a)]},
+            {"span": float(s_b), "chord": float(c_b), "sweep_angle": float(sw_b), "twist": float(tw_b), "taper": float(ta_b), "x": float(x_b), "z": float(z_c), "airfoil_name": AIRFOIL_ROSTER[int(af_idx_b)]},
+            {"span": float(s_c), "chord": float(c_c), "sweep_angle": float(sw_c), "twist": float(tw_c), "taper": float(ta_c), "x": float(x_c), "z": float(z_c), "airfoil_name": AIRFOIL_ROSTER[int(af_idx_c)]}
         ]
     }
 
@@ -96,196 +100,119 @@ def evaluate_design(x):
         data = r.json()
         ld = float(data.get("lift_to_drag_ratio", 0.0))
         cm = float(data.get("pitch_moment", 99.0))
-    except Exception:
-        return 99999.0 
+    except: return 99999.0 
 
-    # --- THE UNIVERSAL PHYSICS BALANCER ---
-    base_score = -ld 
-    cm_penalty = (abs(cm) ** 2) * 5000 
-    
-    # Volume calculation for both surfaces
-    tip_c_a = max(0.01, c_a * ta_a)
-    vol_a = (s_a * (c_a + tip_c_a) / 2.0) * ((c_a + tip_c_a) / 2.0 * 0.10)
-    
-    tip_c_b = max(0.01, c_b * ta_b)
-    vol_b = (s_b * (c_b + tip_c_b) / 2.0) * ((c_b + tip_c_b) / 2.0 * 0.10)
-    
-    total_volume = vol_a + vol_b
-    
-    volume_penalty = 0.0
-    target_volume = 0.0015 # Still need 1.5 Liters of total space
-    if total_volume < target_volume:
-        volume_penalty = ((target_volume - total_volume) ** 2) * 1000000
-
-    # Structural Mass (Spars for both wings)
-    spar_weight_a = (s_a ** 2) / (c_a * 10.0)
-    spar_weight_b = (s_b ** 2) / (c_b * 10.0)
-    
-    # THE INVISIBLE PIPE PENALTY: Fuselage Boom Weight
-    distance_between_wings = math.sqrt((x_a - x_b)**2 + (z_a - z_b)**2)
-    fuselage_weight = distance_between_wings * 0.5 
-    
-    structural_penalty = (spar_weight_a + spar_weight_b + fuselage_weight) * 0.5 
-
-    # --- THE NEW WINGTIP JOINT PENALTY ---
-    # Calculate the exact 3D coordinates of both wingtips
-    tip_x_a = x_a + (s_a / 2.0) * math.tan(math.radians(sw_a))
-    tip_x_b = x_b + (s_b / 2.0) * math.tan(math.radians(sw_b))
-    
-    # Calculate the physical distance between the two wingtips
-    tip_gap = math.sqrt((tip_x_a - tip_x_b)**2 + (z_a - z_b)**2 + ((s_a/2.0) - (s_b/2.0))**2)
-
-    joint_penalty = 0.0
-    # If the AI tries to join the wings (tips are within 15cm of each other)...
-    if tip_gap < 0.15:
-        # ...the joint MUST be thick enough to hold a structural bracket/spar!
-        joint_thickness = tip_c_a + tip_c_b
-        if joint_thickness < 0.15: # Demands at least 15cm of combined physical material
-            joint_penalty = ((0.15 - joint_thickness) ** 2) * 5000000
-    
-    # Final fitness includes the new joint penalty
-    fitness = base_score + cm_penalty + volume_penalty + structural_penalty + joint_penalty
-    
-    if ld > best_ld_seen and abs(cm) < 0.05 and total_volume >= target_volume:
-        best_ld_seen = ld
-        
-    iteration_count += 1
+    fitness = -ld + (abs(cm)**2)*5000 
+    if ld > best_ld_seen and abs(cm) < 0.05: best_ld_seen = ld
     return fitness
 
 def print_progress(xk, convergence):
     global vlm_history
-    s_a, c_a, sw_a, tw_a, ta_a, x_a, z_a, af_idx_a = xk[0:8]
-    s_b, c_b, sw_b, tw_b, ta_b, x_b, z_b, af_idx_b = xk[8:16]
-    
-    config = "Flying Wing"
-    if s_b < 0.3: config = "Flying Wing (Surface B Deleted)"
-    elif x_b > x_a + 0.3: config = "Conventional (Tail in Back)"
-    elif x_b < x_a - 0.3: config = "Canard (Tail in Front)"
-    elif abs(x_b - x_a) <= 0.3 and abs(z_b - z_a) > 0.1: config = "Biplane / Tandem"
-    elif abs(x_b - x_a) <= 0.3 and abs(z_b - z_a) <= 0.1: config = "Joined Wing"
-    
-    print(f"🧬 VLM Iteration | Guessing Config: [{config}] | Est L/D: {best_ld_seen:.1f}")
-
+    print(f"🧬 Route: {target_config} | Best L/D: {best_ld_seen:.1f}")
+    sys.stdout.flush()
     vlm_history.append(best_ld_seen)
-    if len(vlm_history) > 20:
-        vlm_history.pop(0)
+    if len(vlm_history) > 20: vlm_history.pop(0)
     
-    if len(vlm_history) == 20:
-        if (max(vlm_history) - min(vlm_history)) < 0.1:
-            print("\n🛑 VLM PLATEAU REACHED: No significant improvement in 20 generations. Moving to CFD.")
-            return True 
+    if best_ld_seen > 0.1 and len(vlm_history) == 20:
+        if (max(vlm_history) - min(vlm_history)) < 0.1: 
+            print("\n🛑 VLM PLATEAU REACHED.")
+            sys.stdout.flush()
+            return True
     return False
 
-# ====================================================================
-# PHASE 2 & 3: THE INFINITE CFD REFINEMENT LOOP
-# ====================================================================
-def run_cfd_refinement_loop(champion_params):
-    print("\n" + "🔥"*25)
-    print("PHASE 2: INITIATING INFINITE CFD REFINEMENT LOOP")
-    print("🔥"*25)
+def run_cfd_refinement_loop(champion_surfaces):
+    print("\n" + "🔥"*25 + "\nPHASE 2: INFINITE CFD REFINEMENT LOOP\n" + "🔥"*25)
+    sys.stdout.flush()
     
-    current_design = champion_params.copy()
-    cfd_history = []
-    
-    best_cfd_ld = -999.0
-    best_cfd_design = None
-    
-    step = 1
-    while True:
-        print(f"\n🔄 --- CFD REFINEMENT GENERATION {step} ---")
-        
-        cfd_payload = current_design.copy()
-        cfd_payload["run_cfd"] = True
-        cfd_payload["export_final_stl"] = False 
-        
-        try:
-            cfd_r = requests.post(DELL_LINUX_URL, json=cfd_payload, timeout=400)
-            cfd_data = cfd_r.json()
-            cfd_ld = float(cfd_data.get('lift_to_drag_ratio', 0.0))
-            cfd_lift = cfd_data.get('raw_cfd_lift', 0.0)
-            cfd_drag = cfd_data.get('raw_cfd_drag', 0.0)
-            
-            print(f"📊 FluidX3D Results -> Lift: {cfd_lift:.2f} | Drag: {cfd_drag:.2f} | True L/D: {cfd_ld:.2f}")
-            
-            if cfd_ld > best_cfd_ld:
-                best_cfd_ld = cfd_ld
-                best_cfd_design = current_design.copy()
-                
-            cfd_history.append(cfd_ld)
-            
-            if len(cfd_history) >= 3:
-                last_3 = cfd_history[-3:]
-                variance = max(last_3) - min(last_3)
-                if variance <= 0.01:
-                    print(f"\n🛑 CFD PLATEAU REACHED: Last 3 scores fluctuated by only {variance:.3f}.")
-                    break
-            
-        except Exception as e:
-            print(f"❌ CFD Run Failed: {e}. Aborting refinement.")
-            break
-            
-        print("🧠 LLM Analyzing Multi-Surface CFD results...")
-        refinement_sys = """You are an AI aerodynamicist fine-tuning a multi-surface aircraft.
-Make SLIGHT adjustments to the spans, chords, sweeps, twists, and positions to improve Lift-to-Drag.
-Output ONLY valid JSON matching the exact structure of the input 'surfaces' array.
-Do NOT output markdown (```json)."""
-
-        user_msg = f"""CURRENT DESIGN:
-{json.dumps(current_design, indent=2)}
-
-CFD WIND TUNNEL RESULTS: L/D: {cfd_ld}
-
-INSTRUCTIONS: Output the updated JSON payload tweaking variables to increase L/D."""
-
-        prompt = tokenizer.apply_chat_template([
-            {"role": "system", "content": refinement_sys}, 
-            {"role": "user", "content": user_msg}
-        ], tokenize=False, add_generation_prompt=True)
-
-        response = generate(model, tokenizer, prompt=prompt, max_tokens=300, sampler=make_sampler(temp=0.3)).strip()
-        
-        try:
-            clean_json = response.replace("```json", "").replace("```", "").strip()
-            new_params = json.loads(clean_json)
-            current_design = new_params
-        except Exception as e:
-            print(f"⚠️ LLM Output parsing failed. Keeping current design for next loop.")
-            
-        step += 1
-
-    if best_cfd_design:
-        print("\n🎉 OPTIMIZATION COMPLETE! Generating Final 3D STL...")
-        final_payload = best_cfd_design.copy()
-        final_payload["run_cfd"] = True
-        final_payload["export_final_stl"] = True
-        
-        try:
-            requests.post(DELL_LINUX_URL, json=final_payload, timeout=400)
-            print("✅ ULTIMATE_CFD_CHAMPION.stl successfully saved on the Linux server!")
-            print(f"FINAL STATS -> True L/D: {best_cfd_ld:.2f}")
-        except Exception as e:
-            print(f"⚠️ Failed to export final STL: {e}")
-
-if __name__ == "__main__":
-    print(f"🚀 PHASE 1: GENETIC ALGORITHM (Universal MDO Exploration)\n")
-    start_time = time.time()
-    
-    result = differential_evolution(
-        evaluate_design, dynamic_bounds, strategy='best1bin', 
-        maxiter=1000, popsize=15, tol=0.01, callback=print_progress, disp=False
-    )
-    
-    x = result.x
-    vlm_champion = {
-        "run_cfd": False,
-        "surfaces": [
-            {"span": float(x[0]), "chord": float(x[1]), "sweep_angle": float(x[2]), "twist": float(x[3]), "taper": float(x[4]), "x": float(x[5]), "z": float(x[6]), "airfoil_name": AIRFOIL_ROSTER[int(x[7])]},
-            {"span": float(x[8]), "chord": float(x[9]), "sweep_angle": float(x[10]), "twist": float(x[11]), "taper": float(x[12]), "x": float(x[13]), "z": float(x[14]), "airfoil_name": AIRFOIL_ROSTER[int(x[15])]}
-        ]
+    state = {
+        "wing_span": champion_surfaces[0]["span"], "wing_chord": champion_surfaces[0]["chord"], "wing_x": champion_surfaces[0]["x"],
+        "tail_span": champion_surfaces[1]["span"], "tail_chord": champion_surfaces[1]["chord"], "tail_x": champion_surfaces[1]["x"],
+        "fuse_span": champion_surfaces[2]["span"], "fuse_chord": champion_surfaces[2]["chord"], "fuse_x": champion_surfaces[2]["x"]
     }
     
-    print("\n" + "="*50)
-    print(f"🎯 VLM CONVERGENCE ACHIEVED in {time.time() - start_time:.1f} seconds!")
-    print("="*50)
+    cfd_history = []
+    best_cfd_ld = -1.0
+    best_payload = None
+    step, skip_cfd, ld = 1, False, 0.0
     
+    while step <= 10:
+        if not skip_cfd:
+            payload = {"run_cfd": True, "export_final_stl": False, "surfaces": champion_surfaces}
+            payload["surfaces"][0]["span"], payload["surfaces"][0]["chord"], payload["surfaces"][0]["x"] = state["wing_span"], state["wing_chord"], state["wing_x"]
+            payload["surfaces"][1]["span"], payload["surfaces"][1]["chord"], payload["surfaces"][1]["x"] = state["tail_span"], state["tail_chord"], state["tail_x"]
+            payload["surfaces"][2]["span"], payload["surfaces"][2]["chord"], payload["surfaces"][2]["x"] = state["fuse_span"], state["fuse_chord"], state["fuse_x"]
+            
+            try:
+                print(f"⏳ Waiting for FluidX3D Simulation on Linux (This takes a few minutes)...")
+                sys.stdout.flush()
+                r = requests.post(DELL_LINUX_URL, json=payload, timeout=400)
+                data = r.json()
+                
+                ld = float(data.get('lift_to_drag_ratio', 0.0))
+                # DEEP DEBUG: Extract Raw Lift and Drag
+                raw_lift = float(data.get('raw_cfd_lift', 0.0))
+                raw_drag = float(data.get('raw_cfd_drag', 0.0))
+                
+                if ld > best_cfd_ld:
+                    best_cfd_ld = ld
+                    best_payload = payload.copy()
+                cfd_history.append(ld)
+                
+                print(f"📊 Step {step} CFD | L/D: {ld:.2f} | Raw Lift: {raw_lift:.2f} | Raw Drag: {raw_drag:.2f}")
+                sys.stdout.flush()
+                
+                if len(cfd_history) >= 3 and (max(cfd_history[-3:]) - min(cfd_history[-3:])) < 0.01: 
+                    print("\n🛑 CFD PLATEAU REACHED.")
+                    break
+            except Exception as e: 
+                print(f"❌ CFD Run Failed: {e}")
+                break
+
+        ref_sys = f"""You are an aerospace engineer. Improve the Lift-to-Drag ratio. Maintain {target_config}.
+CRITICAL: You MUST change the numerical values slightly to explore new geometries. Do NOT output identical numbers.
+Output ONLY valid JSON matching this exact structure:
+{{
+  "wing_span": float, "wing_chord": float, "wing_x": float,
+  "tail_span": float, "tail_chord": float, "tail_x": float,
+  "fuse_span": float, "fuse_chord": float, "fuse_x": float
+}}
+Return ONLY JSON."""
+        
+        prompt = tokenizer.apply_chat_template([
+            {"role": "system", "content": ref_sys}, 
+            {"role": "user", "content": f"Current State: {json.dumps(state)}. L/D is {ld}. Modify the values to improve aerodynamic efficiency."}
+        ], tokenize=False, add_generation_prompt=True)
+
+        response = generate(model, tokenizer, prompt=prompt, max_tokens=1024, sampler=make_sampler(temp=0.3)).strip()
+        
+        try:
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                new_state = json.loads(json_match.group(0))
+                if new_state == state:
+                    print("⚠️ LLM returned identical values. Forcing retry...")
+                    skip_cfd = True
+                    continue
+                
+                for k in state.keys(): state[k] = float(new_state.get(k, state[k]))
+                step += 1 
+                skip_cfd = False
+            else: raise ValueError("No JSON block found.")
+        except Exception as e:
+            print("⚠️ 14B Model generated invalid JSON. Retrying...")
+            skip_cfd = True
+
+    if best_payload:
+        print("\n🎉 OPTIMIZATION COMPLETE! Generating Final 3D STL...")
+        best_payload["export_final_stl"] = True
+        requests.post(DELL_LINUX_URL, json=best_payload)
+
+if __name__ == "__main__":
+    result = differential_evolution(evaluate_design, dynamic_bounds, popsize=6, workers=1, updating='deferred', callback=print_progress)
+    x = result.x
+    vlm_champion = [
+        {"span": float(x[0]), "chord": float(x[1]), "sweep_angle": float(x[2]), "twist": float(x[3]), "taper": float(x[4]), "x": float(x[5]), "z": float(x[16]), "airfoil_name": AIRFOIL_ROSTER[int(x[7])]},
+        {"span": float(x[8]), "chord": float(x[9]), "sweep_angle": float(x[10]), "twist": float(x[11]), "taper": float(x[12]), "x": float(x[13]), "z": float(x[16]), "airfoil_name": AIRFOIL_ROSTER[int(x[15])]},
+        {"span": float(x[16]), "chord": float(x[17]), "sweep_angle": float(x[18]), "twist": float(x[19]), "taper": float(x[20]), "x": float(x[21]), "z": float(x[16]), "airfoil_name": AIRFOIL_ROSTER[int(x[23])]}
+    ]
     run_cfd_refinement_loop(vlm_champion)
