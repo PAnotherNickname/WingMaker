@@ -48,9 +48,19 @@ Launch Server:
 uvicorn physics_server2:app --host 0.0.0.0 --port 8000
 ```
 
-🚀 Workflow
+Workflow
 1. Start the Linux Server first.
 2. Run python mlx_brain2.py on your Mac.
 3. Enter your design goal (e.g., "Long endurance surveillance drone").
 4. Watch the VLM Plateau and CFD Refinement stages.
 5. Collect the ULTIMATE_CFD_CHAMPION.stl from the Linux machine.
+
+🚀TODO:
+1. Basic flying wing generation [*]
+2. Generation of different flying wing designs [patrially]
+3. Physical tests of generated model with FluidX3D [*]
+4. Physical tests of generated model with OpenFOAM []
+5. Migration of everything to single machine (macbook) []
+6. Automatic AI system that will cuts models according to 3d printer size and specifications (and generate joints between parts) []
+7. Simple WebGUI with model preview during generation []
+
